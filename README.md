@@ -166,18 +166,220 @@
 
 <a id="source"></a>
 ### Source - подключение к источнику (t1_src)
-<p>Создаем сервер</p>
-<p>Перебор всех файлов в папке с помощью скрипта, внешняя таблица</p>
+
+<div>
+  <h4>📥 Подключение к исходным данным (ETL: Ingestion)</h4>
+  <p>
+    Для загрузки данных из внешних CSV-файлов используется расширение <code>file_fdw</code> PostgreSQL — Foreign Data Wrapper для чтения файлов как таблиц.  
+    Это позволяет работать с файлами на диске <b>как с обычными SQL-таблицами</b>, не используя <code>COPY</code> напрямую.
+  </p>
+
+  <p><strong>Архитектура подключения:</strong></p>
+  <ol>
+    <li>
+      <strong>Создание сервера доступа к файлам</strong> (<code>csv_server</code>)
+      <pre><code>CREATE EXTENSION IF NOT EXISTS file_fdw;
+CREATE SERVER IF NOT EXISTS csv_server FOREIGN DATA WRAPPER file_fdw;</code></pre>
+    </li>
+    <li>
+      <strong>Хранение метаданных о структуре источников</strong> в отдельной таблице:
+      <pre><code>CREATE TABLE t1_src.table_metadata (
+    entity_name VARCHAR(64) PRIMARY KEY,
+    columns_def TEXT NOT NULL,
+    has_header BOOLEAN NOT NULL
+);</code></pre>
+      Все поля во внешних таблицах хранятся как <code>VARCHAR(256)</code>.<br>
+      Пример записи:
+      <pre><code>'application', 
+'application_id VARCHAR(256), product_type_cd...', 
+false</code></pre>
+    </li>
+    <li>
+      <strong>Генерация DDL внешних таблиц через шаблон</strong>
+      <pre><code>CREATE OR REPLACE FUNCTION t1_src.generate_foreign_table_ddl(
+    target_schema TEXT,
+    entity TEXT
+) RETURNS TEXT AS $code$
+...
+$$ LANGUAGE plpgsql;</code></pre>
+      <strong>Что делает функция:</strong>
+      <ul>
+        <li>Берёт метаданные по имени сущности.</li>
+        <li>Формирует команду PowerShell для чтения всех <code>.csv</code> из папки <code>C:\Data\<entity>\</code>.</li>
+        <li>Удаляет лишние кавычки <code>""</code> с помощью <code>-replace '""'</code>.</li>
+        <li>Возвращает <code>CREATE FOREIGN TABLE ...</code>.</li>
+      </ul>
+    </li>
+    <li>
+      <strong>Перебор всех файлов в папке с помощью PowerShell:</strong>
+      <pre><code>Get-ChildItem 'C:\Data\service_request\*.csv' | ForEach-Object { (Get-Content $_.FullName) -replace '""' }</code></pre>
+      Эта команда объединяет все CSV-файлы в один поток, удаляя "пустые" кавычки, что предотвращает ошибки парсинга.
+    </li>
+  </ol>
+</div>
+
 <a id="staging"></a>
-### Staging слой (t2_stg)
-<p>Создаем все хэши</p>
-<p>Инкрементальтная загрузка - используем служебную таблицу</p>
-<p>логика инкремента и last_update в таблицах</p>
+### Staging-слой (t2_stg)
+
+<div>
+  <h4>🔄 Промежуточный слой обработки данных (ETL: Staging)</h4>
+  <p>
+    Слой <code>t2_stg</code> служит буфером между сырыми данными (<code>t1_src</code>) и ядром хранилища (<code>t3_core</code>).  
+    В отличие от source-слоя, здесь все таблицы уже физически существуют в БД.
+  </p>
+
+  <p><strong>Ключевые особенности слоя:</strong></p>
+  <ul>
+    <li><b>Инкрементальная загрузка:</b> Используется служебная таблица <code>t2_stg.load_registry</code> для отслеживания времени последней успешной загрузки каждой таблицы (<code>last_load_dttm</code>). После запуска процедур загрузки в staging-слой попадают только те записи, которые были изменены или добавлены после предыдущей загрузки.</li>
+    <li><b>Предварительное вычисление хешей:</b> Для всех бизнес-ключей формируются хеш-ключи — уникальные идентификаторы записей в Data Vault. Ключи создаются на этом этапе для сущностей и их связей в соответствии со структурой ядра хранилища. Вычисление выполняется с помощью алгоритма <code>MD5</code>, результат — строка из 32 символов.<br><br>
+      Пример формирования хешей для будущих записей в <code>HUB_application</code>, <code>HUB_account</code> и <code>LINK_acc_x_app</code>:
+      <pre><code>upper(md5(upper(trim(coalesce(sca.account_id, ''))))) as account_hash_key,
+upper(md5(upper(trim(coalesce(sca.application_id, ''))))) as application_hash_key,
+upper(md5(upper(concat(
+    trim(coalesce(sca.account_id, '')), ':',
+    trim(coalesce(sca.application_id, ''))
+)))) as acc_x_app_hash_key,</code></pre>
+    </li>
+    <li><b>Хранение hash_diff:</b> Помимо хешей ключей, вычисляются контрольные хеши атрибутов (<code>hash_diff</code>), позволяющие эффективно реализовать историчность (SCD2) в Data Vault при последующей загрузке в ядро.</li>
+  </ul>
+
+  <p><strong>Механизм инкрементальной загрузки:</strong></p>
+  <ol>
+    <li>Перед загрузкой процедура обращается к <code>t2_stg.load_registry</code>, чтобы получить <code>last_load_dttm</code> — временную метку последнего запуска.</li>
+    <li>Загружаются только строки, где:
+      <ul>
+        <li><code>last_update >= last_load_dttm</code> — были обновлены с момента прошлой загрузки;</li>
+        <li><code>delete_dttm >= last_load_dttm</code> — помечены как удалённые.</li>
+      </ul>
+    </li>
+    <li>После успешной загрузки текущее время фиксируется в <code>load_registry</code>, обеспечивая корректность следующего инкремента.</li>
+  </ol>
+
+  <p><strong>Структура таблиц:</strong> Все атрибуты сохраняют тип <code>VARCHAR(256)</code>, а хеш-поля — <code>VARCHAR(32)</code>.</p>
+  <pre><code>-- Пример: staging_application
+CREATE TABLE t2_stg.staging_application (
+    application_hash_key VARCHAR(32),
+    customer_hash_key VARCHAR(32),
+    cust_x_app_hash_key VARCHAR(32),
+    application_id VARCHAR(256),
+    product_type_cd VARCHAR(256),
+    customer_id VARCHAR(256),
+    advert_source_id VARCHAR(256),
+    create_dttm VARCHAR(256),
+    delete_dttm VARCHAR(256),
+    last_update VARCHAR(256),
+    hash_diff VARCHAR(32)
+);</code></pre>
+
+  <p><strong>Процедуры загрузки:</strong></p>
+  <ul>
+    <li><code>t2_stg.load_ref_tables()</code> — загружает справочники (типы, статусы).</li>
+    <li><code>t2_stg.load_staging_*</code> — отдельные процедуры для каждой бизнес-сущности с инкрементальной логикой.</li>
+    <li>Функции <code>t2_stg.get_last_load()</code> и <code>t2_stg.record_load()</code> обеспечивают работу с реестром загрузок: получение временной метки последней загрузки и фиксация новой.</li>
+  </ul>
+</div>
+
 <a id="core"></a>
 ### Core слой (t3_core)
-<p>Таблица версий и загрузок</p>
-<p>временная таблица с данными</p>
-<p>даммики в хабах</p>
-<p>загрузка линков вместе с сателлитами</p>
-<p>логика историчности в сателлитах</p>
+<div>
+  <h4>💾 Ядро хранилища (Data Vault 2.0)</h4>
+  <p>
+    Слой <code>t3_core</code> реализует архитектуру <strong>Data Vault 2.0</strong> — гибкую, масштабируемую и историзированную модель хранения данных.  
+    Данные из <code>t2_stg</code> трансформируются и загружаются в <strong>Хабы (HUB)</strong>, <strong>Линки (LINK)</strong> и <strong>Сателлиты (SAT)</strong>.
+  </p>
 
+  <p><strong>Ключевые особенности слоя:</strong></p>
+  <ul>
+    <li><b>Реестр загрузок с версионностью:</b> Таблица <code>t3_core.load_version_registry</code> хранит не только время последней загрузки, но и <code>version_id</code> — номер версии данных. Это позволяет корректно управлять SCD2 в сателлитах.</li>
+    <li><b>Временные unlogged таблицы:</b> На этапе загрузки используется <code>CREATE UNLOGGED TABLE staging_data</code> для буферизации данных. Это повышает производительность за счёт отказа от WAL-логирования.</li>
+    <li><b>Агрегация источников для Хабов:</b> При загрузке хабов данные собираются из <i>всех возможных staging-таблиц</i>, где мог встретиться бизнес-ключ. Например, новые записи для <code>HUB_customer</code> собираются из <code>staging_cab_customer</code>, <code>staging_crm_customer</code>, <code>staging_application</code> и <code>staging_service_request</code>.</li>
+    <li><b>Одновременная загрузка LINK + LSAT:</b> Линки и их сателлиты загружаются вместе, так как связи в нашей системе не имеют собственных атрибутов для описания. Связь может быть либо актуальной, либо удалённой, поэтому нет смысла создавать отдельные процедуры для такой простой логики.</li>
+  </ul>
+
+  <p><strong>Логика поддержания историчности в HSAT_* сателлитах хабов (на примере HSAT_account):</strong></p>
+  <ol>
+    <li>
+      <b>Получение метаданных о последней загрузке</b>
+      <pre><code>SELECT * INTO last_load_dttm, next_version
+FROM t3_core.get_last_version_load(hsat_table_name);</code></pre>
+      Процедура получает:
+      <ul>
+        <li><code>last_load_dttm</code> — временную метку предыдущей загрузки (для инкремента).</li>
+        <li><code>next_version</code> — номер следующей версии (увеличивается на 1).</li>
+      </ul>
+    </li>
+    <li>
+      <b>Создание временной таблицы <code>staging_data</code></b>
+      <pre><code>CREATE UNLOGGED TABLE staging_data AS ...</code></pre>
+      Временная таблица содержит:
+      <ul>
+        <li>Данные из <code>t2_stg.staging_crm_account</code> (источник).</li>
+        <li>Атрибут <code>account_type_nm</code> из справочника.</li>
+        <li>Текущие значения <code>account_hash_key</code> и <code>hash_diff</code> из <code>HSAT_account</code>, где <code>effective_to_dttm = '2999-12-31'</code> (активная версия).</li>
+      </ul>
+      Использование <code>UNLOGGED</code> повышает производительность за счёт отказа от WAL-логирования.
+    </li>
+    <li>
+      <b>Подсчёт количества новых/изменённых записей</b>
+      <pre><code>select ( select count(*) from staging_data where 
+			(sd.hsat_account_hash_key is null
+			or sd.hash_diff <> sd.hsat_hash_diff)
+			and NULLIF(TRIM(sd.delete_dttm), '') IS NULL ) into rows_num;</code></pre>
+      Подсчитываются строки, которые:
+      <ul>
+        <li>Отсутствуют в сателлите (<code>hsat_account_hash_key IS NULL</code>),</li>
+        <li>Имеют отличный <code>hash_diff</code> (изменились атрибуты),</li>
+        <li>Не помечены как удалённые (<code>delete_dttm IS NULL</code>).</li>
+      </ul>
+      Результат сохраняется в <code>rows_num</code> для контроля и логирования. В сателлитах, в которых мало атрибутов и отсутствует <code>hash_diff</code>, все атрибуты сравниваются напрямую.
+    </li>
+    <li>
+      <b>Вставка новых версий</b>
+      <pre><code>INSERT INTO t3_core.HSAT_account (...) SELECT ... FROM staging_data ...</code></pre>
+      Для всех записей, прошедших проверку, создаётся новая версия с параметрами:
+      <ul>
+        <li><code>version_id = next_version</code>,</li>
+        <li><code>effective_from_dttm = now()</code>,</li>
+        <li><code>effective_to_dttm = '2999-12-31'</code> (открыта до закрытия),</li>
+        <li><code>src_cd = 'CRM'</code>.</li>
+      </ul>
+      Это стандартная операция SCD2 — добавление новой строки вместо изменения старой.
+    </li>
+    <li>
+      <b>Закрытие старых версий</b>
+      <pre><code>WITH tab1 AS (...) UPDATE t3_core.HSAT_account SET effective_to_dttm = current_dttm ...</code></pre>
+      Все активные версии, у которых:
+      <ul>
+        <li>изменился <code>hash_diff</code>,</li>
+        <li>или появилось значение <code>delete_dttm</code>,</li>
+      </ul>
+      закрываются: <code>effective_to_dttm</code> устанавливается в текущее время, а <code>delete_dt</code> — в дату удаления.
+    </li>
+    <li>
+      <b>Обновление реестра версий</b>
+      <pre><code>IF rows_num > 0 THEN PERFORM t3_core.record_version_load(...); END IF;</code></pre>
+      Если были вставлены новые версии, в таблицу <code>t3_core.load_version_registry</code> записывается:
+      <ul>
+        <li>Название таблицы,</li>
+        <li>Время загрузки,</li>
+        <li>Номер версии.</li>
+      </ul>
+      Это обеспечивает правильную работу инкрементальной загрузки в будущем.
+    </li>
+  </ol>
+
+  <p><strong>Структура сателлитов:</strong></p>
+  <ul>
+    <li><code>HSAT_*</code>: Атрибуты сущностей (например, <code>account_type_nm</code>, <code>birth_dt</code>).</li>
+    <li><code>LSAT_*</code>: Атрибуты связей (например, дата создания заявки в <code>LSAT_cust_x_app</code>).</li>
+    <li>Общие поля: <code>version_id</code>, <code>effective_from_dttm</code>, <code>effective_to_dttm</code>, <code>src_cd</code>.</li>
+  </ul>
+
+  <p><strong>Процедуры загрузки:</strong></p>
+  <ul>
+    <li><code>t3_core.load_hub_*</code> — загрузка хабов.</li>
+    <li><code>t3_core.load_<link>()</code> — загрузка линка и его сателлита (например, <code>load_acc_x_app</code>).</li>
+    <li><code>t3_core.load_hsat_*</code> — загрузка сателлитов с поддержкой SCD2.</li>
+    <li>Функции <code>t3_core.get_last_version_load()</code> и <code>t3_core.record_version_load()</code> управляют реестром версий.</li>
+  </ul>
+</div>
