@@ -3,7 +3,17 @@
 -- create extension postgres_fdw;
 
 
--- 1. Создание таблиц в staging
+-- 1. Создание таблицы load_registry
+
+CREATE SCHEMA IF NOT EXISTS t2_stg;
+drop table if exists t2_stg.load_registry;
+
+CREATE TABLE t2_stg.load_registry (
+    table_name VARCHAR(64),
+    load_dttm timestamp
+);
+
+-- 2. Создание таблиц в staging
 -- 1. advert_source
 create schema if not exists t2_stg;
 
@@ -70,8 +80,8 @@ CREATE TABLE t2_stg.staging_crm_account (
     application_id VARCHAR(256),
     create_dttm VARCHAR(256),
     delete_dttm VARCHAR(256),
-    last_update VARCHAR(256),
-    hash_diff varchar(32)
+    hash_diff varchar(32),
+    last_update varchar(32)
 );
 
 -- 5. crm_account_status
@@ -104,7 +114,8 @@ CREATE TABLE t2_stg.staging_crm_customer (
     create_dttm VARCHAR(256),
     delete_dttm VARCHAR(256),
     last_update VARCHAR(256),
-    hash_diff varchar(32)
+    hash_diff varchar(32),
+    hash_diff_con VARCHAR(32)
 );
 
 -- 8. crm_transaction
@@ -176,14 +187,6 @@ CREATE TABLE t2_stg.staging_service_request_type (
     last_update VARCHAR(256)
 );
 
--- 2. Создание таблицы load_registry
-
-drop table if exists t2_stg.load_registry;
-
-CREATE TABLE t2_stg.load_registry (
-    table_name VARCHAR(64),
-    load_dttm timestamp
-);
 
 -- 3. Загрузка справочников
 CREATE OR REPLACE PROCEDURE t2_stg.load_ref_tables()
@@ -280,7 +283,10 @@ $$ language plpgsql;
 
 
 -- 4.2 Процедуры
-create or replace procedure t2_stg.load_staging_advert_source()
+create or replace procedure t2_stg.load_staging_advert_source(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -313,9 +319,10 @@ begin
 		delete_dttm,
 		last_update
 	from t1_src.source_advert_source sas
-	where 1!=1
-		or sas.last_update::timestamp >= last_load_dttm
-		or sas.delete_dttm::timestamp >= last_load_dttm;
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= sas.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > sas.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_advert_source)
 	into rows_num;
@@ -330,7 +337,10 @@ end;
 $$;
 
 
-create or replace procedure t2_stg.load_staging_application()
+create or replace procedure t2_stg.load_staging_application(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -371,15 +381,14 @@ begin
 		sa.delete_dttm,
 		sa.last_update,
 		upper(md5(upper(concat(
-			trim(coalesce(spt.product_type_nm, '')), ':',
-			trim(coalesce(sa.create_dttm, ''))
+			trim(coalesce(spt.product_type_nm, ''))
 		)))) as hash_diff
 	from 
 		t1_src.source_application sa 
 		left join t2_stg.staging_product_type spt using(product_type_cd)
-	where 1!=1
-		or sa.last_update::timestamp >= last_load_dttm
-		or sa.delete_dttm::timestamp >= last_load_dttm;
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= sa.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > sa.last_update::timestamp;
 
 	select (select count(*) from t2_stg.staging_application)
 	into rows_num;
@@ -393,7 +402,10 @@ begin
 	end;
 $$;
 
-create or replace procedure t2_stg.load_staging_cab_customer()
+create or replace procedure t2_stg.load_staging_cab_customer(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -446,8 +458,7 @@ begin
 			trim(coalesce(last_nm, '')), ':',
 			trim(coalesce(middle_nm, '')), ':',
 			trim(coalesce(birth_dt, '')), ':',
-			trim(coalesce(passport_num, '')), ':',
-			trim(coalesce(create_dttm, ''))
+			trim(coalesce(passport_num, ''))
 		)))) as hash_diff,
 		upper(md5(upper(concat(
 			trim(coalesce(phone_num, '')), ':',
@@ -455,11 +466,12 @@ begin
 			trim(coalesce(email, '')), ':',
 			trim(coalesce(reg_address_txt, '')), ':',
 			trim(coalesce(fact_address_txt, ''))
-		)))) as hash_diff_c0n
+		)))) as hash_diff_con
 	from t1_src.source_cab_customer scc
-	where 1!=1
-		or scc.last_update::timestamp >= last_load_dttm
-		or scc.delete_dttm::timestamp >= last_load_dttm;
+	where 
+        coalesce(start_time, '1900-01-01'::timestamp) <= scc.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > scc.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_cab_customer)
 	into rows_num;
@@ -473,7 +485,12 @@ begin
 end;
 $$;
 
-create or replace procedure t2_stg.load_staging_crm_account()
+
+
+create or replace procedure t2_stg.load_staging_crm_account(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -517,15 +534,15 @@ begin
 		sca.last_update,
 		upper(md5(upper(concat(
 			trim(coalesce(sast.account_type_nm, '')), ':',
-			trim(coalesce(sca.account_create_dt, '')), ':',
-			trim(coalesce(sca.create_dttm, ''))
+			trim(coalesce(sca.account_create_dt, ''))
 		)))) as hash_diff
 	from 
 		t1_src.source_crm_account sca
 		left join t2_stg.staging_crm_account_status_type sast using(account_type_cd)
-	where 1!=1
-		or sca.last_update::timestamp >= last_load_dttm
-		or sca.delete_dttm::timestamp >= last_load_dttm;
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= sca.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > sca.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_crm_account)
 	into rows_num;
@@ -539,7 +556,12 @@ begin
 end;
 $$;
 
-create or replace procedure t2_stg.load_staging_crm_customer()
+
+
+create or replace procedure t2_stg.load_staging_crm_customer(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -563,7 +585,8 @@ begin
 		create_dttm, 
 		delete_dttm,
 		last_update,
-		hash_diff
+		hash_diff,
+		hash_diff_con
 	)
 	SELECT
 		upper(md5(upper(trim(coalesce(customer_id, ''))))) as customer_hash_key,
@@ -580,13 +603,17 @@ begin
 		upper(md5(upper(concat(
 			trim(coalesce(first_nm, '')), ':',
 			trim(coalesce(last_nm, '')), ':',
-			trim(coalesce(birth_dt, '')), ':',
-			trim(coalesce(create_dttm, ''))
-		)))) as hash_diff
+			trim(coalesce(birth_dt, ''))
+		)))) as hash_diff,
+		upper(md5(upper(concat(
+			trim(coalesce(phone_num, '')), ':',
+			trim(coalesce(email, ''))
+		)))) as hash_diff_con
 	from t1_src.source_crm_customer scc
-	where 1!=1
-		or scc.last_update::timestamp >= last_load_dttm
-		or scc.delete_dttm::timestamp >= last_load_dttm;
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= scc.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > scc.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_crm_customer)
 	into rows_num;
@@ -600,7 +627,10 @@ begin
 end;
 $$;
 
-create or replace procedure t2_stg.load_staging_crm_transaction()
+create or replace procedure t2_stg.load_staging_crm_transaction(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -632,7 +662,9 @@ begin
 	)
 	SELECT
 		upper(md5(upper(trim(coalesce(sct.transaction_id, ''))))) as transaction_hash_key,
-		upper(md5(upper(trim(coalesce(sct.orig_id, ''))))) as orig_transaction_hash_key,
+		case when sct.orig_id != sct.transaction_id then
+			upper(md5(upper(trim(coalesce(sct.orig_id, ''))))) 
+		else NULL end as orig_transaction_hash_key,
 		upper(md5(upper(trim(coalesce(sct.account_id, ''))))) as account_hash_key,
 		upper(md5(upper(concat(
 			trim(coalesce(sct.account_id, '')), ':',
@@ -654,15 +686,15 @@ begin
 		upper(md5(upper(concat(
 			trim(coalesce(sct.transaction_amt, '')), ':',
 			trim(coalesce(sct.transaction_dttm, '')), ':',
-			trim(coalesce(sctt.transaction_type_nm, '')), ':',
-			trim(coalesce(sct.create_dttm, ''))
+			trim(coalesce(sctt.transaction_type_nm, ''))
 		)))) as hash_diff
 	from 
 		t1_src.source_crm_transaction sct
 		left join t2_stg.staging_crm_transaction_type sctt using(transaction_type_cd)
-	where 1!=1
-		or sct.last_update::timestamp >= last_load_dttm
-		or sct.delete_dttm::timestamp >= last_load_dttm;
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= sct.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp) > sct.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_crm_transaction)
 	into rows_num;
@@ -676,7 +708,10 @@ begin
 end;
 $$;
 
-create or replace procedure t2_stg.load_staging_service_request()
+create or replace procedure t2_stg.load_staging_service_request(
+    start_time timestamp default null,
+    end_time timestamp default null
+)
 language plpgsql
 as $$
 declare 
@@ -719,14 +754,16 @@ begin
 		upper(md5(upper(concat(
 			trim(coalesce(ssr.tail_limit, '')), ':',
 			trim(coalesce(ssrt.service_request_type_nm, '')), ':',
-			trim(coalesce(ssr.create_dttm, ''))
+			trim(coalesce(ssrs.service_request_status_nm, ''))
 		)))) as hash_diff
 	from 
 		t1_src.source_service_request ssr
 		left join t2_stg.staging_service_request_type ssrt using(service_request_type_cd)
-	where 1!=1
-		or ssr.last_update::timestamp >= last_load_dttm
-		or ssr.delete_dttm::timestamp >= last_load_dttm;
+		left join t2_stg.staging_service_request_status ssrs using(service_request_status_cd)
+	where
+        coalesce(start_time, '1900-01-01'::timestamp) <= ssr.last_update::timestamp
+		and  coalesce(end_time, '2999-12-31'::timestamp)> ssr.last_update::timestamp;
+
 
 	select (select count(*) from t2_stg.staging_service_request)
 	into rows_num;
@@ -740,12 +777,48 @@ begin
 end;
 $$;
 
-call t2_stg.load_ref_tables();
 
-call t2_stg.load_staging_advert_source();
-call t2_stg.load_staging_application();
-call t2_stg.load_staging_cab_customer();
-call t2_stg.load_staging_crm_account();
-call t2_stg.load_staging_crm_customer();
-call t2_stg.load_staging_crm_transaction();
-call t2_stg.load_staging_service_request();
+call t2_stg.load_ref_tables();
+call t2_stg.load_staging_advert_source(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_application(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_cab_customer(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_crm_account(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_crm_customer(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_crm_transaction(start_time => '2019-12-12'::timestamp);
+call t2_stg.load_staging_service_request(start_time => '2019-12-12'::timestamp);
+
+
+call t2_stg.load_staging_crm_account(start_time => '2019-12-31'::timestamp, end_time => '2020-05-31'::timestamp);
+call t2_stg.load_staging_crm_account(start_time => '2020-05-31'::timestamp, end_time => '2020-06-03'::timestamp);
+call t2_stg.load_staging_crm_account(start_time => '2020-06-03'::timestamp);
+
+
+call t2_stg.load_staging_crm_account(start_time => '2019-12-31'::timestamp);
+
+CREATE OR REPLACE PROCEDURE t2_stg.load_all_staging_batch(
+    p_start_date TIMESTAMP,
+    p_end_date TIMESTAMP
+) AS $$
+BEGIN
+        
+        -- Вызываем все staging процедуры для текущей даты
+        CALL t2_stg.load_staging_advert_source(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_application(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_cab_customer(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_crm_account(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_crm_customer(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_crm_transaction(start_time => p_start_date, end_time => p_end_date);
+        CALL t2_stg.load_staging_service_request(start_time => p_start_date, end_time => p_end_date);
+        
+    
+    RAISE NOTICE '=== Загрузка завершена!';
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+CALL t2_stg.load_all_staging_batch(
+    p_start_date => '2021-12-31'::timestamp,
+    p_end_date => '2022-12-31'::timestamp
+);
+
