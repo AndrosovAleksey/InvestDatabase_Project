@@ -145,7 +145,7 @@ BEGIN
 
     -- Формируем команду PowerShell - указываем путь к папке, где лежат данные
     ps_cmd := format(
-        $$powershell -command "Get-ChildItem 'C:\\Data\\%I\\*.csv' | ForEach-Object { (Get-Content $_.FullName) -replace '""' }"$$,
+        $$powershell -command "Get-ChildItem 'C:\\Data_synth\\%I\\*.csv' | ForEach-Object { (Get-Content $_.FullName) -replace '""' }"$$,
         entity
     ); 
 
