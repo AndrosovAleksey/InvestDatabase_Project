@@ -163,7 +163,10 @@
 <a id="разработка-хранилища-данных-с-историчностью"></a>
 ## Разработка ядра Хранилища Данных с историчностью
 
-
+  <picture>
+    <img alt="System Architecture" src="https://github.com/AndrosovAleksey/InvestDatabase_Project/blob/main/static/Архитектура.png">
+  </picture>
+  
 <a id="source"></a>
 ### Source - подключение к источнику (t1_src)
 
